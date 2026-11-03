@@ -737,7 +737,7 @@ export class MainView extends LitElement {
         this._anthropicEffort = 'low';
         this._answerOnlyQuestions = true;
         this._quickAnswerEnabled = true;
-        this._quickAnswerModel = 'claude-haiku-5-5';
+        this._quickAnswerModel = 'claude-sonnet-5-5';
         this._openaiKey = '';
         this._geminiLiveModel = 'gemini-3.1-flash-live-preview';
         this._groqModel = 'qwen/qwen3.6-27b';
@@ -783,7 +783,7 @@ export class MainView extends LitElement {
             this._anthropicEffort = config.anthropicEffort || 'low';
             this._answerOnlyQuestions = config.answerOnlyQuestions !== false;
             this._quickAnswerEnabled = config.quickAnswerEnabled !== false;
-            this._quickAnswerModel = config.quickAnswerModel || 'claude-haiku-5-5';
+            this._quickAnswerModel = config.quickAnswerModel || 'claude-sonnet-5-5';
             this._openaiKey = creds.openaiKey || '';
             this._geminiLiveModel = config.geminiLiveModel || 'gemini-3.1-flash-live-preview';
             this._groqModel = config.groqModel || 'qwen/qwen3.6-27b';
@@ -995,7 +995,7 @@ export class MainView extends LitElement {
 
     async _saveQuickAnswerModel(val) {
         this._quickAnswerModel = val;
-        await cheatingDaddy.storage.updateConfig('quickAnswerModel', val.trim() || 'claude-haiku-5-5');
+        await cheatingDaddy.storage.updateConfig('quickAnswerModel', val.trim() || 'claude-sonnet-5-5');
         this.requestUpdate();
     }
 

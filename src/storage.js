@@ -19,7 +19,7 @@ const DEFAULT_CONFIG = {
     answerOnlyQuestions: true,
     // A fast model writes a short opening first; the main model then continues it
     quickAnswerEnabled: true,
-    quickAnswerModel: 'claude-haiku-5-5',
+    quickAnswerModel: 'claude-sonnet-5-5',
 };
 
 const DEFAULT_CREDENTIALS = {

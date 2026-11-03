@@ -4,7 +4,7 @@ const Anthropic = AnthropicModule.default || AnthropicModule;
 
 const DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5';
 // Fast model for the quick opening line shown before the full answer
-const DEFAULT_QUICK_MODEL = 'claude-haiku-5-5';
+const DEFAULT_QUICK_MODEL = 'claude-sonnet-5-5';
 const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const CLAUDE_MAX_TOKENS = 16000;
 
