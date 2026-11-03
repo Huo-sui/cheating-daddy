@@ -201,7 +201,45 @@ Provide direct exam answers in **markdown format**. Include the question text, t
     },
 };
 
-function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled = true) {
+function hasText(value) {
+    return typeof value === 'string' && value.trim() !== '';
+}
+
+function hasBackground(background) {
+    return !!background && ['about', 'targetRole', 'stories', 'style'].some(key => hasText(background[key]));
+}
+
+// Renders the user's structured background plus grounding rules that tell the model
+// to answer as the user, from the user's real experience, instead of giving generic advice.
+function buildBackgroundSection(background, customPrompt) {
+    const blocks = [];
+    if (hasText(background.about)) blocks.push(`<about_me>\n${background.about.trim()}\n</about_me>`);
+    if (hasText(background.targetRole)) blocks.push(`<target_role>\n${background.targetRole.trim()}\n</target_role>`);
+    if (hasText(background.stories)) blocks.push(`<key_stories>\n${background.stories.trim()}\n</key_stories>`);
+    if (hasText(background.style)) blocks.push(`<answer_style>\n${background.style.trim()}\n</answer_style>`);
+    if (hasText(customPrompt)) blocks.push(`<additional_instructions>\n${customPrompt.trim()}\n</additional_instructions>`);
+
+    return `User-provided context
+-----
+The user filled in the background below. It is the source of truth about who they are.
+
+<user_background>
+${blocks.join('\n\n')}
+</user_background>
+
+**HOW TO USE THE BACKGROUND (most important rules):**
+- Speak as the user, in the first person ("I led...", "At my last company I..."). Your text is what they will say out loud.
+- Ground every answer in the user's real experience. For behavioral, experience, motivation or "how would you..." questions, pick the single most relevant item from <about_me> or <key_stories> and use its concrete specifics: company, project, role, numbers, outcome.
+- Tailor emphasis to <target_role>: highlight the skills and results that matter most for that role and company.
+- Never invent employers, titles, projects, metrics or credentials that are not in the background. If nothing in the background fits, give a short answer structure and mark the part the user must fill in with [brackets], e.g. "[your example of handling a missed deadline]".
+- For purely factual or technical questions, answer correctly and directly first, then connect it to the user's experience only when it is natural and true.
+- The example answers earlier in these instructions only show tone and format. Never reuse their facts (roles, years, technologies, companies); use the user's background instead.
+- Avoid generic, interchangeable answers that anyone could give. If an answer would sound the same for any candidate, rewrite it using the user's specifics.
+- If <answer_style> or <additional_instructions> conflict with the format rules above, follow <answer_style> and <additional_instructions>.
+-----`;
+}
+
+function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled = true, background = null) {
     const sections = [promptParts.intro, '\n\n', promptParts.formatRequirements];
 
     // Only add search usage section if Google Search is enabled
@@ -209,17 +247,22 @@ function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled =
         sections.push('\n\n', promptParts.searchUsage);
     }
 
-    sections.push('\n\n', promptParts.content, '\n\nUser-provided context\n-----\n', customPrompt, '\n-----\n\n', promptParts.outputInstructions);
+    if (hasBackground(background)) {
+        sections.push('\n\n', promptParts.content, '\n\n', buildBackgroundSection(background, customPrompt), '\n\n', promptParts.outputInstructions);
+    } else {
+        sections.push('\n\n', promptParts.content, '\n\nUser-provided context\n-----\n', customPrompt, '\n-----\n\n', promptParts.outputInstructions);
+    }
 
     return sections.join('');
 }
 
-function getSystemPrompt(profile, customPrompt = '', googleSearchEnabled = true) {
+function getSystemPrompt(profile, customPrompt = '', googleSearchEnabled = true, background = null) {
     const promptParts = profilePrompts[profile] || profilePrompts.interview;
-    return buildSystemPrompt(promptParts, customPrompt, googleSearchEnabled);
+    return buildSystemPrompt(promptParts, customPrompt, googleSearchEnabled, background);
 }
 
 module.exports = {
     profilePrompts,
     getSystemPrompt,
+    hasBackground,
 };

@@ -3,7 +3,17 @@ const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig } = require('../storage');
+const {
+    getAvailableModel,
+    incrementLimitCount,
+    getApiKey,
+    getGroqApiKey,
+    getAnthropicApiKey,
+    getUserBackground,
+    incrementCharUsage,
+    getConfig,
+} = require('../storage');
+const { streamClaudeResponse, describeClaudeError, isAbortError, DEFAULT_QUICK_MODEL } = require('./claude');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
 
@@ -19,6 +29,49 @@ let currentProviderMode = 'byok';
 
 // Groq conversation history for context
 let groqConversationHistory = [];
+
+// Claude conversation history (text only) and the prompt Claude answers with
+let claudeConversationHistory = [];
+let currentClaudeSystemPrompt = null;
+let currentClaudeQuickPrompt = null;
+const CLAUDE_MAX_HISTORY_MESSAGES = 40;
+const CLAUDE_REFUSAL_MESSAGE = 'Claude declined to answer this one. Try rephrasing the question.';
+
+const CLAUDE_INPUT_SOURCES = `**WHERE MESSAGES COME FROM:**
+- "Heard:" messages are live speech-to-text of the other side of the call. They can contain transcription errors, and one question can be split across several "Heard:" messages because the speaker paused.
+- The last "Heard:" message may still be in progress: the speaker can be mid-sentence. Speed matters, so as soon as the question is clear, answer it without waiting for the speaker to finish their last words.
+- "Typed:" and "Screenshot:" messages come directly from the user. Always answer them.
+- When several "Heard:" messages arrive in a row, read them as one continuous utterance and answer the complete question they form, once.
+- An "Opening:" message comes from the app, not from the other side: the user is already saying that opening out loud. Reply with only the rest of the answer. Continue directly from the opening's last sentence, keep its story, facts and stance, and never repeat, rephrase or contradict it. Never reply [WAIT] to it.`;
+
+const CLAUDE_WAIT_RULES = `**WHEN TO STAY SILENT:**
+- If the latest "Heard:" speech, read together with any unanswered "Heard:" messages before it, does not yet contain a question, request, or point the user needs to respond to, reply with exactly [WAIT] and nothing else.
+- Reply [WAIT] for audio checks ("Can you hear me?"), acknowledgements ("Great, thanks", "Okay"), remarks not addressed to the user, and when the speaker is still giving context and the question is not clear yet.
+- A greeting or small-talk question addressed to the user ("Hi, how are you?") gets a short, natural reply, not [WAIT].
+- When unsure whether a question was asked, answer: missing a real question is worse than an unneeded answer.
+- Never reply [WAIT] to "Typed:" or "Screenshot:" messages.`;
+
+const CLAUDE_QUICK_RULES = `**QUICK OPENING (your only job in this reply):**
+The user needs something to say within a second. Write only the start of the answer. A fuller answer is written right after yours and continues from your last sentence.
+Reply in exactly this shape and nothing else:
+**Q:** <the question, restated in at most 12 words>
+
+<One or two short spoken sentences that open the answer in the user's voice, grounded in their background: give the direct answer, or name the experience or story you will use. Do not conclude or summarize; leave room to continue.>
+Use the language that <answer_style> asks for, if it sets one.`;
+
+// The Claude prompt adds how to read live transcripts; the wait rules are optional (setting "Only answer questions").
+function buildClaudeSystemPrompt(basePrompt) {
+    const sections = [basePrompt, CLAUDE_INPUT_SOURCES];
+    if (getConfig().answerOnlyQuestions !== false) {
+        sections.push(CLAUDE_WAIT_RULES);
+    }
+    return sections.join('\n\n');
+}
+
+// Prompt for the fast model that writes the quick opening (question summary + first sentences).
+function buildClaudeQuickPrompt(basePrompt) {
+    return [buildClaudeSystemPrompt(basePrompt), CLAUDE_QUICK_RULES].join('\n\n');
+}
 
 // Conversation tracking variables
 let currentSessionId = null;
@@ -46,7 +99,6 @@ module.exports.formatSpeakerResults = formatSpeakerResults;
 // Audio capture variables
 let systemAudioProc = null;
 let messageBuffer = '';
-let groqRequestStartedForTurn = false;
 
 const GROQ_MAX_COMPLETION_TOKENS = 16384;
 const GROQ_EMPTY_RESPONSE_MESSAGE =
@@ -83,10 +135,12 @@ function initializeNewSession(profile = null, customPrompt = null) {
     currentSessionId = Date.now().toString();
     startTransportLog(currentSessionId);
     currentTranscription = '';
-    groqRequestStartedForTurn = false;
+    resetPendingUtterance();
+    resetClaudeSpeechState();
     conversationHistory = [];
     screenAnalysisHistory = [];
     groqConversationHistory = [];
+    claudeConversationHistory = [];
     currentProfile = profile;
     currentCustomPrompt = customPrompt;
     console.log('New conversation session started:', currentSessionId, 'profile:', profile);
@@ -211,18 +265,367 @@ function hasGroqKey() {
     return key && key.trim() != '';
 }
 
-function sendFinalTranscriptionToGroq() {
-    if (!hasGroqKey() || groqRequestStartedForTurn) {
+// helper to check if Anthropic (Claude) has been configured
+function hasClaudeKey() {
+    const key = getAnthropicApiKey();
+    return !!key && key.trim() !== '';
+}
+
+// When Claude or Groq is configured, Gemini Live only transcribes and the answer comes from that model.
+// Claude takes priority over Groq.
+function hasExternalAnswerEngine() {
+    return hasClaudeKey() || hasGroqKey();
+}
+
+function sendTypedTextToAnswerEngine(text) {
+    if (hasClaudeKey()) {
+        return sendTypedTextToClaude(text);
+    }
+    return sendToGroq(text);
+}
+
+function trimClaudeHistory() {
+    if (claudeConversationHistory.length > CLAUDE_MAX_HISTORY_MESSAGES) {
+        claudeConversationHistory = claudeConversationHistory.slice(-CLAUDE_MAX_HISTORY_MESSAGES);
+    }
+    // The conversation must start with a user message
+    while (claudeConversationHistory.length > 0 && claudeConversationHistory[0].role !== 'user') {
+        claudeConversationHistory.shift();
+    }
+}
+
+function removeClaudeMessage(message) {
+    const index = claudeConversationHistory.indexOf(message);
+    if (index !== -1) {
+        claudeConversationHistory.splice(index, 1);
+    }
+}
+
+function getClaudeSystemPrompt() {
+    return currentClaudeSystemPrompt || currentSystemPrompt || 'You are a helpful assistant.';
+}
+
+// Claude replies with this marker when the speech so far needs no answer yet (see CLAUDE_WAIT_RULES).
+const CLAUDE_WAIT_MARKER = '[WAIT]';
+
+function isWaitMarkerPrefix(text) {
+    const trimmed = text.trimStart();
+    return CLAUDE_WAIT_MARKER.startsWith(trimmed) || trimmed.startsWith(CLAUDE_WAIT_MARKER);
+}
+
+// Streams one Claude reply for `messages`. Text goes to `display` as it arrives, except a reply that is
+// (or may still turn out to be) the wait marker when `allowWait` is set.
+// `quick` uses the fast model and quick-opening prompt instead of the main model.
+async function streamClaudeReply({ messages, allowWait = false, signal, display, quick = false }) {
+    const config = getConfig();
+    const result = await streamClaudeResponse({
+        apiKey: getAnthropicApiKey(),
+        model: quick ? config.quickAnswerModel || DEFAULT_QUICK_MODEL : config.anthropicModel,
+        effort: config.anthropicEffort,
+        system: quick ? currentClaudeQuickPrompt || getClaudeSystemPrompt() : getClaudeSystemPrompt(),
+        fast: quick,
+        maxTokens: quick ? 1024 : undefined,
+        messages,
+        signal,
+        onText: text => {
+            if (allowWait && isWaitMarkerPrefix(text)) return;
+            display(text);
+        },
+    });
+    const answer = result.text.trim();
+    return { ...result, answer, waited: allowWait && answer.startsWith(CLAUDE_WAIT_MARKER) };
+}
+
+// Runs one Claude turn for a typed message or screenshot: always answered, shown as a new response.
+// `userContent` is what Claude sees for this turn; `historyText` is the text-only version kept for later turns.
+async function runClaudeTurn({ userContent, historyText, logPrefix, onSaved }) {
+    const model = getConfig().anthropicModel;
+    const historyMessage = { role: 'user', content: historyText };
+    claudeConversationHistory.push(historyMessage);
+    trimClaudeHistory();
+
+    // Send the history with this turn's full content (e.g. an image) in place of the text-only copy
+    const messages = claudeConversationHistory.map(message => (message === historyMessage ? { role: 'user', content: userContent } : message));
+
+    logTransportEvent(`${logPrefix}.request`, { model, text: historyText });
+    sendToRenderer('update-status', 'Claude is thinking...');
+
+    let isFirst = true;
+    const showText = text => {
+        sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
+        isFirst = false;
+    };
+
+    try {
+        const result = await streamClaudeReply({ messages, display: showText });
+
+        if (result.stopReason === 'refusal') {
+            removeClaudeMessage(historyMessage);
+            logTransportEvent(`${logPrefix}.refusal`, { model: result.model });
+            showText(CLAUDE_REFUSAL_MESSAGE);
+            sendToRenderer('update-status', 'Listening...');
+            return { success: false, error: CLAUDE_REFUSAL_MESSAGE };
+        }
+
+        if (!result.answer) {
+            removeClaudeMessage(historyMessage);
+            sendToRenderer('update-status', 'Listening...');
+            return { success: false, error: 'Claude returned an empty answer' };
+        }
+
+        claudeConversationHistory.push({ role: 'assistant', content: result.answer });
+        onSaved(result.answer, result.model);
+        logTransportEvent(`${logPrefix}.completed`, { model: result.model, response: result.answer, stopReason: result.stopReason });
+        sendToRenderer('update-status', 'Listening...');
+        return { success: true, text: result.answer, model: result.model };
+    } catch (error) {
+        removeClaudeMessage(historyMessage);
+        const message = describeClaudeError(error);
+        console.error('Error calling Claude API:', error);
+        logTransportEvent(`${logPrefix}.error`, { error: error.message, stack: error.stack });
+        sendToRenderer('update-status', 'Claude error: ' + message);
+        return { success: false, error: message };
+    }
+}
+
+async function sendTypedTextToClaude(typedText) {
+    const text = (typedText || '').trim();
+    if (text === '' || !hasClaudeKey()) return { success: false, error: 'Nothing to send' };
+
+    console.log('Sending typed text to Claude:', text.substring(0, 100) + '...');
+    return runClaudeTurn({
+        userContent: `Typed: ${text}`,
+        historyText: `Typed: ${text}`,
+        logPrefix: 'claude.text',
+        onSaved: answer => saveConversationTurn(text, answer),
+    });
+}
+
+// ---- Live speech: answer while the other person is still talking ----
+// Gemini delivers the transcript in fragments. With Claude, every short gap in the fragments starts a
+// draft answer for everything heard so far; a newer draft cancels the older one and overwrites the
+// same response on screen. So the answer is usually already appearing when the speaker finishes.
+// After UTTERANCE_SILENCE_MS without new fragments the utterance is committed to the conversation.
+// Groq has no drafts: it answers once the utterance is committed.
+const DRAFT_DELAY_MS = 400;
+const UTTERANCE_SILENCE_MS = 1000;
+const QUESTION_END = /[?？]\s*$/;
+
+let liveUtterance = ''; // speech of the current utterance, not yet committed
+let draftTimer = null;
+let commitTimer = null;
+let speechDraft = null; // { text, committed, controller, result, aborted }
+let speechBubbleOpen = false; // a response for the current, unanswered question is on screen
+let unansweredSpeech = []; // committed speech since the last answer; saved together as one history entry
+
+function queueTranscriptFragment(fragment) {
+    if (!fragment || fragment.trim() === '') return;
+    liveUtterance += fragment;
+
+    if (commitTimer) clearTimeout(commitTimer);
+    commitTimer = setTimeout(commitUtterance, UTTERANCE_SILENCE_MS);
+
+    if (!hasClaudeKey()) return;
+    if (draftTimer) clearTimeout(draftTimer);
+    // A question mark is a strong hint the question is complete: draft right away
+    draftTimer = setTimeout(() => startSpeechDraft(liveUtterance.trim(), false), QUESTION_END.test(fragment) ? 0 : DRAFT_DELAY_MS);
+}
+
+function commitUtterance() {
+    if (commitTimer) clearTimeout(commitTimer);
+    if (draftTimer) clearTimeout(draftTimer);
+    commitTimer = null;
+    draftTimer = null;
+
+    const text = liveUtterance.trim();
+    liveUtterance = '';
+    if (text === '') return;
+
+    if (!hasClaudeKey()) {
+        if (hasGroqKey()) sendToGroq(text);
         return;
     }
 
-    const transcription = currentTranscription.trim();
-    if (transcription === '') {
+    claudeConversationHistory.push({ role: 'user', content: `Heard: ${text}` });
+    trimClaudeHistory();
+    unansweredSpeech.push(text);
+    logTransportEvent('claude.speech.committed', { text });
+
+    if (speechDraft && speechDraft.text === text && !speechDraft.aborted) {
+        // The latest draft already covers exactly this utterance: keep it
+        speechDraft.committed = true;
+        if (speechDraft.result) finishSpeechDraft(speechDraft);
+    } else {
+        startSpeechDraft(text, true);
+    }
+}
+
+function startSpeechDraft(text, committed) {
+    if (!text) return;
+    if (!committed && speechDraft && !speechDraft.aborted && speechDraft.text === text) return;
+
+    if (speechDraft) {
+        speechDraft.aborted = true;
+        speechDraft.controller.abort();
+    }
+
+    const draft = { text, committed, controller: new AbortController(), result: null, aborted: false };
+    speechDraft = draft;
+
+    // A committed utterance is already the last history message; a draft adds it as a provisional tail
+    const messages = committed ? [...claudeConversationHistory] : [...claudeConversationHistory, { role: 'user', content: `Heard: ${text}` }];
+
+    logTransportEvent('claude.speech.draft', { text, committed });
+    sendToRenderer('update-status', 'Claude is thinking...');
+
+    runSpeechAnswer(draft, messages)
+        .then(result => {
+            if (draft.aborted) return;
+            draft.result = result;
+            if (draft.committed) {
+                finishSpeechDraft(draft);
+            } else if (result.waited) {
+                sendToRenderer('update-status', 'Listening... (no question yet)');
+            } else {
+                sendToRenderer('update-status', 'Listening...');
+            }
+        })
+        .catch(error => {
+            if (draft.aborted || isAbortError(error)) return;
+            if (speechDraft === draft) speechDraft = null;
+            const message = describeClaudeError(error);
+            console.error('Error calling Claude API:', error);
+            logTransportEvent('claude.speech.error', { error: error.message, stack: error.stack });
+            sendToRenderer('update-status', 'Claude error: ' + message);
+        });
+}
+
+// Removes the "**Q:** ..." summary line, leaving the spoken opening sentences.
+function extractOpening(quickText) {
+    return quickText
+        .split('\n')
+        .filter(line => !/^\s*(\*\*)?Q(\*\*)?\s*[:：]/.test(line))
+        .join('\n')
+        .trim();
+}
+
+// Answers the speech in `messages`. With the quick opening on (default):
+//   1. the fast model writes "**Q:** summary" + one or two opening sentences, shown within about a second;
+//   2. the main model writes the rest, continuing from that opening, appended below it.
+// Without it, the main model answers in one go. Every draft for the same open question overwrites one
+// response on screen instead of adding new ones.
+async function runSpeechAnswer(draft, messages) {
+    const config = getConfig();
+    const allowWait = config.answerOnlyQuestions !== false;
+    const signal = draft.controller.signal;
+    const show = displayText => {
+        if (draft.aborted) return;
+        sendToRenderer(speechBubbleOpen ? 'update-response' : 'new-response', displayText);
+        speechBubbleOpen = true;
+    };
+
+    let quickText = '';
+    if (config.quickAnswerEnabled !== false) {
+        try {
+            const quick = await streamClaudeReply({ messages, allowWait, signal, display: show, quick: true });
+            if (quick.waited) return quick;
+            if (quick.stopReason !== 'refusal') quickText = quick.answer;
+        } catch (error) {
+            if (isAbortError(error)) throw error;
+            // The opening is a speed-up only: on failure, the main model answers on its own
+            console.error('Quick opening failed:', error);
+            logTransportEvent('claude.speech.quick_error', { error: error.message });
+        }
+    }
+
+    const opening = quickText ? extractOpening(quickText) : '';
+    if (!opening) {
+        const result = await streamClaudeReply({ messages, allowWait, signal, display: show });
+        return { ...result, shown: result.answer, spoken: result.answer };
+    }
+
+    if (!draft.aborted) sendToRenderer('update-status', 'Writing the full answer...');
+    const prefix = `${quickText}\n\n`;
+    const full = await streamClaudeReply({
+        messages: [...messages, { role: 'user', content: `Opening: ${opening}` }],
+        signal,
+        display: continuation => show(prefix + continuation),
+    });
+
+    // If the main model fails to continue, the opening alone is still the answer
+    const continuation = full.stopReason === 'refusal' ? '' : full.answer;
+    return {
+        model: full.model,
+        stopReason: full.stopReason === 'refusal' ? 'end_turn' : full.stopReason,
+        waited: false,
+        answer: continuation ? `${opening}\n\n${continuation}` : opening,
+        shown: continuation ? prefix + continuation : quickText,
+        spoken: continuation ? `${opening}\n\n${continuation}` : opening,
+    };
+}
+
+function finishSpeechDraft(draft) {
+    if (speechDraft === draft) speechDraft = null;
+    const result = draft.result;
+
+    if (result.stopReason === 'refusal') {
+        // Drop the declined speech so it is not sent again with the next question
+        while (claudeConversationHistory.length > 0 && claudeConversationHistory.at(-1).role === 'user') {
+            claudeConversationHistory.pop();
+        }
+        unansweredSpeech = [];
+        sendToRenderer(speechBubbleOpen ? 'update-response' : 'new-response', CLAUDE_REFUSAL_MESSAGE);
+        speechBubbleOpen = false;
+        logTransportEvent('claude.speech.refusal', { model: result.model });
+        sendToRenderer('update-status', 'Listening...');
         return;
     }
 
-    groqRequestStartedForTurn = true;
-    sendToGroq(transcription);
+    if (result.waited || !result.answer) {
+        // No answer yet: the speech stays in the conversation and is read together with what comes next
+        sendToRenderer('update-status', result.waited ? 'Listening... (no question yet)' : 'Listening...');
+        return;
+    }
+
+    // History keeps what the user says (opening + continuation); the saved turn keeps what was shown
+    claudeConversationHistory.push({ role: 'assistant', content: result.spoken || result.answer });
+    saveConversationTurn(unansweredSpeech.join(' '), result.shown || result.answer);
+    unansweredSpeech = [];
+    speechBubbleOpen = false;
+    logTransportEvent('claude.speech.completed', { model: result.model, response: result.shown || result.answer });
+    sendToRenderer('update-status', 'Listening...');
+}
+
+function resetPendingUtterance() {
+    if (commitTimer) clearTimeout(commitTimer);
+    if (draftTimer) clearTimeout(draftTimer);
+    commitTimer = null;
+    draftTimer = null;
+    liveUtterance = '';
+}
+
+function resetClaudeSpeechState() {
+    if (speechDraft) {
+        speechDraft.aborted = true;
+        speechDraft.controller.abort();
+    }
+    speechDraft = null;
+    speechBubbleOpen = false;
+    unansweredSpeech = [];
+}
+
+async function sendImageToClaude(base64Data, prompt) {
+    const promptText = (prompt || '').trim() || 'Help me with what is on the screen.';
+
+    return runClaudeTurn({
+        userContent: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Data } },
+            { type: 'text', text: `Screenshot: ${promptText}` },
+        ],
+        historyText: `Screenshot: [image not kept] ${promptText}`,
+        logPrefix: 'claude.image',
+        onSaved: (answer, model) => saveScreenAnalysis(promptText, answer, model),
+    });
 }
 
 function trimConversationHistoryForGemma(history, maxChars = 42000) {
@@ -653,8 +1056,13 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     const enabledTools = await getEnabledTools();
     const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
 
-    const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
+    const background = getUserBackground();
+    const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled, background);
     currentSystemPrompt = systemPrompt; // Store for Groq
+    // Claude has no Google Search tool here, so build its prompt without the search section
+    const claudeBasePrompt = getSystemPrompt(profile, customPrompt, false, background);
+    currentClaudeSystemPrompt = buildClaudeSystemPrompt(claudeBasePrompt);
+    currentClaudeQuickPrompt = buildClaudeQuickPrompt(claudeBasePrompt);
 
     // Initialize new conversation session only on first connect
     if (!isReconnect) {
@@ -674,20 +1082,25 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     logTransportEvent('gemini.live.message', message);
 
                     // Handle input transcription (what was spoken)
+                    let transcriptFragment = '';
                     if (message.serverContent?.inputTranscription?.results) {
-                        currentTranscription += formatSpeakerResults(message.serverContent.inputTranscription.results);
+                        transcriptFragment = formatSpeakerResults(message.serverContent.inputTranscription.results);
                     } else if (message.serverContent?.inputTranscription?.text) {
                         const text = message.serverContent.inputTranscription.text;
                         if (text.trim() !== '') {
-                            currentTranscription += text;
+                            transcriptFragment = text;
                         }
                     }
 
-                    if (message.serverContent?.inputTranscription) {
-                        sendFinalTranscriptionToGroq();
+                    if (transcriptFragment) {
+                        currentTranscription += transcriptFragment;
+                        // Claude / Groq answer once the speaker pauses, not on the first fragment
+                        if (hasExternalAnswerEngine()) {
+                            queueTranscriptFragment(transcriptFragment);
+                        }
                     }
 
-                    if (!hasGroqKey() && message.serverContent?.outputTranscription?.text) {
+                    if (!hasExternalAnswerEngine() && message.serverContent?.outputTranscription?.text) {
                         const isFirstChunk = messageBuffer === '';
                         messageBuffer += message.serverContent.outputTranscription.text;
                         sendToRenderer(isFirstChunk ? 'new-response' : 'update-response', messageBuffer);
@@ -695,7 +1108,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
                     if (message.serverContent?.generationComplete) {
                         if (currentTranscription.trim() !== '') {
-                            if (!hasGroqKey() && messageBuffer.trim() !== '') {
+                            if (!hasExternalAnswerEngine() && messageBuffer.trim() !== '') {
                                 saveConversationTurn(currentTranscription, messageBuffer);
                             }
                             currentTranscription = '';
@@ -706,8 +1119,10 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     if (message.serverContent?.turnComplete) {
                         currentTranscription = '';
                         messageBuffer = '';
-                        groqRequestStartedForTurn = false;
-                        sendToRenderer('update-status', 'Listening...');
+                        // With Claude / Groq answering, their own code reports status
+                        if (!hasExternalAnswerEngine()) {
+                            sendToRenderer('update-status', 'Listening...');
+                        }
                     }
                 },
                 onerror: function (e) {
@@ -1197,6 +1612,10 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return result;
             }
 
+            if (hasClaudeKey()) {
+                return await sendImageToClaude(data, prompt);
+            }
+
             const result = hasGroqKey() ? await sendImageToGroq(data, prompt) : await sendImageToGeminiHttp(data, prompt);
             return result;
         } catch (error) {
@@ -1236,9 +1655,8 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         try {
             console.log('Sending text message:', text);
 
-            if (hasGroqKey()) {
-                groqRequestStartedForTurn = true;
-                sendToGroq(text.trim());
+            if (hasExternalAnswerEngine()) {
+                sendTypedTextToAnswerEngine(text.trim());
             }
 
             await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
@@ -1279,6 +1697,8 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     ipcMain.handle('close-session', async event => {
         try {
             stopMacOSAudioCapture();
+            resetPendingUtterance();
+            resetClaudeSpeechState();
 
             if (currentProviderMode === 'cloud') {
                 closeCloud();
@@ -1360,6 +1780,8 @@ module.exports = {
     stopMacOSAudioCapture,
     sendAudioToGemini,
     sendImageToGeminiHttp,
+    sendTypedTextToClaude,
+    sendImageToClaude,
     setupGeminiIpcHandlers,
     formatSpeakerResults,
 };

@@ -18,7 +18,8 @@ A real-time AI assistant that provides contextual help during video calls, inter
 
 ## Features
 
-- **Live AI Assistance**: Real-time help powered by Google Gemini 2.0 Flash Live
+- **Live AI Assistance**: Gemini Live transcribes the conversation; Claude (Anthropic) writes the answers
+- **Answers from your background**: Fill in your resume, target role, key stories and answer style on the AI Context page and answers are written in your voice from your real experience
 - **Screen & Audio Capture**: Analyzes what you see and hear for contextual responses
 - **Multiple Profiles**: Interview, Sales Call, Business Meeting, Presentation, Negotiation
 - **Transparent Overlay**: Always-on-top window that can be positioned anywhere
@@ -27,14 +28,15 @@ A real-time AI assistant that provides contextual help during video calls, inter
 
 ## Setup
 
-1. **Get a Gemini API Key**: Visit [Google AI Studio](https://aistudio.google.com/apikey)
-2. **Install Dependencies**: `npm install`
-3. **Run the App**: `npm start`
+1. **Get a Gemini API Key** (used for live transcription): Visit [Google AI Studio](https://aistudio.google.com/apikey)
+2. **Get an Anthropic API Key** (used for answers, recommended): Visit the [Claude Console](https://platform.claude.com/settings/keys)
+3. **Install Dependencies**: `npm install`
+4. **Run the App**: `npm start`
 
 ## Usage
 
-1. Enter your Gemini API key in the main window
-2. Choose your profile and language in settings
+1. Enter your Gemini API key and Anthropic API key in the main window
+2. Fill in your background on the AI Context page, and choose your profile and language in settings
 3. Click "Start Session" to begin
 4. Position the window using keyboard shortcuts
 5. The AI will provide real-time assistance based on your screen and what interview asks

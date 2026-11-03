@@ -1,36 +1,65 @@
 import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
 import { unifiedPageStyles } from './sharedPageStyles.js';
 
+// Structured background fields. Each maps to a preference key in storage and is
+// sent to the AI as its own labelled section so answers draw on the user's real experience.
+const BACKGROUND_FIELDS = [
+    {
+        key: 'backgroundAbout',
+        label: 'About me / resume',
+        placeholder:
+            'Paste your resume or summarize it: current and past roles, companies, years, key skills, education, notable results with numbers.',
+        help: 'Who you are. The AI only uses facts from here and never invents experience.',
+        rows: 8,
+    },
+    {
+        key: 'backgroundTargetRole',
+        label: 'Target role / job description',
+        placeholder: 'Company, role title, the job description, what the team cares about, what you know about the interviewers.',
+        help: 'Answers are tailored to what this role values.',
+        rows: 5,
+    },
+    {
+        key: 'backgroundStories',
+        label: 'Key projects & stories',
+        placeholder:
+            'Your best stories, ideally as Situation / Task / Action / Result. e.g. "Led the checkout redesign at X: conversion +12% in 3 months; had to align eng, design and legal..."',
+        help: 'The AI picks the most relevant story for each question.',
+        rows: 8,
+    },
+    {
+        key: 'backgroundStyle',
+        label: 'Answer style',
+        placeholder: 'e.g. "Answer in Chinese", "Up to 5 bullet points", "Confident but not arrogant", "Always end with a short question back".',
+        help: 'Overrides the default format (length, language, tone).',
+        rows: 3,
+    },
+    {
+        key: 'customPrompt',
+        label: 'Other instructions',
+        placeholder: 'Anything else: topics to avoid, salary expectations, constraints...',
+        help: '',
+        rows: 3,
+    },
+];
+
 export class AICustomizeView extends LitElement {
     static styles = [
         unifiedPageStyles,
         css`
-            .unified-page {
-                height: 100%;
-            }
-            .unified-wrap {
-                height: 100%;
-            }
-            section.surface {
-                flex: 1;
-                display: flex;
-                flex-direction: column;
-            }
             .form-grid {
-                flex: 1;
                 display: flex;
                 flex-direction: column;
-            }
-            .form-group.vertical {
-                flex: 1;
-                display: flex;
-                flex-direction: column;
+                gap: var(--space-lg);
             }
             textarea.control {
-                flex: 1;
-                resize: none;
-                overflow-y: auto;
                 min-height: 0;
+                resize: vertical;
+            }
+            .intro {
+                color: var(--text-muted);
+                font-size: var(--font-size-sm);
+                line-height: 1.5;
             }
         `,
     ];
@@ -38,22 +67,25 @@ export class AICustomizeView extends LitElement {
     static properties = {
         selectedProfile: { type: String },
         onProfileChange: { type: Function },
-        _context: { state: true },
+        _values: { state: true },
     };
 
     constructor() {
         super();
         this.selectedProfile = 'interview';
         this.onProfileChange = () => {};
-        this._context = '';
+        this._values = {};
         this._loadFromStorage();
     }
 
     async _loadFromStorage() {
         try {
             const prefs = await cheatingDaddy.storage.getPreferences();
-            this._context = prefs.customPrompt || '';
-            this.requestUpdate();
+            const values = {};
+            for (const field of BACKGROUND_FIELDS) {
+                values[field.key] = prefs[field.key] || '';
+            }
+            this._values = values;
         } catch (error) {
             console.error('Error loading AI customize storage:', error);
         }
@@ -63,21 +95,9 @@ export class AICustomizeView extends LitElement {
         this.onProfileChange(e.target.value);
     }
 
-    async _saveContext(val) {
-        this._context = val;
-        await cheatingDaddy.storage.updatePreference('customPrompt', val);
-    }
-
-    _getProfileName(profile) {
-        const names = {
-            interview: 'Job Interview',
-            sales: 'Sales Call',
-            meeting: 'Business Meeting',
-            presentation: 'Presentation',
-            negotiation: 'Negotiation',
-            exam: 'Exam Assistant',
-        };
-        return names[profile] || profile;
+    async _saveField(key, value) {
+        this._values = { ...this._values, [key]: value };
+        await cheatingDaddy.storage.updatePreference(key, value);
     }
 
     render() {
@@ -95,6 +115,10 @@ export class AICustomizeView extends LitElement {
                 <div class="unified-wrap">
                     <div>
                         <div class="page-title">AI Context</div>
+                        <div class="intro">
+                            Tell the AI who you are. Answers are written in your voice, from your real experience, instead of generic advice. Changes
+                            apply when you start the next session.
+                        </div>
                     </div>
 
                     <section class="surface">
@@ -105,19 +129,23 @@ export class AICustomizeView extends LitElement {
                                     ${profiles.map(profile => html`<option value=${profile.value}>${profile.label}</option>`)}
                                 </select>
                             </div>
-                            <div class="form-group vertical">
-                                <label class="form-label">Custom Instructions</label>
-                                <textarea
-                                    class="control"
-                                    placeholder="Resume details, role requirements, constraints..."
-                                    .value=${this._context}
-                                    @input=${e => this._saveContext(e.target.value)}
-                                ></textarea>
-                                <div class="form-help">Sent as context at session start. Keep it short.</div>
-                            </div>
+                            ${BACKGROUND_FIELDS.map(
+                                field => html`
+                                    <div class="form-group vertical">
+                                        <label class="form-label">${field.label}</label>
+                                        <textarea
+                                            class="control"
+                                            rows=${field.rows}
+                                            placeholder=${field.placeholder}
+                                            .value=${this._values[field.key] || ''}
+                                            @input=${e => this._saveField(field.key, e.target.value)}
+                                        ></textarea>
+                                        ${field.help ? html`<div class="form-help">${field.help}</div>` : ''}
+                                    </div>
+                                `
+                            )}
                         </div>
                     </section>
-
                 </div>
             </div>
         `;

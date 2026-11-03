@@ -13,15 +13,28 @@ const DEFAULT_CONFIG = {
     groqModel: 'qwen/qwen3.6-27b',
     groqImageModel: 'qwen/qwen3.6-27b',
     disableGroqThinking: true,
+    anthropicModel: 'claude-opus-5-5',
+    anthropicEffort: 'low',
+    // Claude skips small talk and waits until a question is complete before answering
+    answerOnlyQuestions: true,
+    // A fast model writes a short opening first; the main model then continues it
+    quickAnswerEnabled: true,
+    quickAnswerModel: 'claude-sonnet-5-5',
 };
 
 const DEFAULT_CREDENTIALS = {
     apiKey: '',
     groqApiKey: '',
+    anthropicApiKey: '',
 };
 
 const DEFAULT_PREFERENCES = {
     customPrompt: '',
+    // Structured personal background used to ground answers
+    backgroundAbout: '',
+    backgroundTargetRole: '',
+    backgroundStories: '',
+    backgroundStyle: '',
     providerMode: 'byok',
     selectedProfile: 'interview',
     selectedLanguage: 'en-US',
@@ -209,6 +222,14 @@ function setGroqApiKey(groqApiKey) {
     return setCredentials({ groqApiKey });
 }
 
+function getAnthropicApiKey() {
+    return getCredentials().anthropicApiKey || '';
+}
+
+function setAnthropicApiKey(anthropicApiKey) {
+    return setCredentials({ anthropicApiKey });
+}
+
 // ============ PREFERENCES ============
 
 function getPreferences() {
@@ -234,6 +255,17 @@ function updatePreference(key, value) {
     const preferences = getPreferences();
     preferences[key] = value;
     return writeJsonFile(getPreferencesPath(), preferences);
+}
+
+// Structured personal background (resume, target role, stories, style)
+function getUserBackground() {
+    const preferences = getPreferences();
+    return {
+        about: preferences.backgroundAbout || '',
+        targetRole: preferences.backgroundTargetRole || '',
+        stories: preferences.backgroundStories || '',
+        style: preferences.backgroundStyle || '',
+    };
 }
 
 // ============ KEYBINDS ============
@@ -513,11 +545,14 @@ module.exports = {
     setApiKey,
     getGroqApiKey,
     setGroqApiKey,
+    getAnthropicApiKey,
+    setAnthropicApiKey,
 
     // Preferences
     getPreferences,
     setPreferences,
     updatePreference,
+    getUserBackground,
 
     // Keybinds
     getKeybinds,
