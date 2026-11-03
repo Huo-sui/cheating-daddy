@@ -701,6 +701,8 @@ export class MainView extends LitElement {
         _anthropicModel: { state: true },
         _anthropicEffort: { state: true },
         _answerOnlyQuestions: { state: true },
+        _quickAnswerEnabled: { state: true },
+        _quickAnswerModel: { state: true },
         _openaiKey: { state: true },
         _geminiLiveModel: { state: true },
         _groqModel: { state: true },
@@ -734,6 +736,8 @@ export class MainView extends LitElement {
         this._anthropicModel = 'claude-opus-5-5';
         this._anthropicEffort = 'low';
         this._answerOnlyQuestions = true;
+        this._quickAnswerEnabled = true;
+        this._quickAnswerModel = 'claude-haiku-5-5';
         this._openaiKey = '';
         this._geminiLiveModel = 'gemini-3.1-flash-live-preview';
         this._groqModel = 'qwen/qwen3.6-27b';
@@ -778,6 +782,8 @@ export class MainView extends LitElement {
             this._anthropicModel = config.anthropicModel || 'claude-opus-5-5';
             this._anthropicEffort = config.anthropicEffort || 'low';
             this._answerOnlyQuestions = config.answerOnlyQuestions !== false;
+            this._quickAnswerEnabled = config.quickAnswerEnabled !== false;
+            this._quickAnswerModel = config.quickAnswerModel || 'claude-haiku-5-5';
             this._openaiKey = creds.openaiKey || '';
             this._geminiLiveModel = config.geminiLiveModel || 'gemini-3.1-flash-live-preview';
             this._groqModel = config.groqModel || 'qwen/qwen3.6-27b';
@@ -978,6 +984,18 @@ export class MainView extends LitElement {
     async _saveAnswerOnlyQuestions(enabled) {
         this._answerOnlyQuestions = enabled;
         await cheatingDaddy.storage.updateConfig('answerOnlyQuestions', enabled);
+        this.requestUpdate();
+    }
+
+    async _saveQuickAnswerEnabled(enabled) {
+        this._quickAnswerEnabled = enabled;
+        await cheatingDaddy.storage.updateConfig('quickAnswerEnabled', enabled);
+        this.requestUpdate();
+    }
+
+    async _saveQuickAnswerModel(val) {
+        this._quickAnswerModel = val;
+        await cheatingDaddy.storage.updateConfig('quickAnswerModel', val.trim() || 'claude-haiku-5-5');
         this.requestUpdate();
     }
 
@@ -1269,6 +1287,23 @@ export class MainView extends LitElement {
                             <span class="config-summary-description">Skip small talk and wait until a question is finished</span>
                         </span>
                     </label>
+
+                    <label class="config-checkbox">
+                        <input type="checkbox" .checked=${this._quickAnswerEnabled} @change=${e => this._saveQuickAnswerEnabled(e.target.checked)} />
+                        <span class="config-checkbox-text">
+                            <span class="config-summary-title">Quick opening</span>
+                            <span class="config-summary-description"
+                                >A fast model shows the question and your first sentence; the full answer continues it</span
+                            >
+                        </span>
+                    </label>
+
+                    ${this._quickAnswerEnabled
+                        ? html`<div class="form-group">
+                              <label class="form-label">Quick opening model</label>
+                              <input type="text" .value=${this._quickAnswerModel} @input=${e => this._saveQuickAnswerModel(e.target.value)} />
+                          </div>`
+                        : ''}
 
                     <div class="config-note">
                         With an Anthropic key, Claude writes every answer using your background from the AI Context page. Gemini only transcribes.

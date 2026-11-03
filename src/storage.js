@@ -17,6 +17,9 @@ const DEFAULT_CONFIG = {
     anthropicEffort: 'low',
     // Claude skips small talk and waits until a question is complete before answering
     answerOnlyQuestions: true,
+    // A fast model writes a short opening first; the main model then continues it
+    quickAnswerEnabled: true,
+    quickAnswerModel: 'claude-haiku-5-5',
 };
 
 const DEFAULT_CREDENTIALS = {

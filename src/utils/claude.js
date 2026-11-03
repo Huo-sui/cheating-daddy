@@ -3,12 +3,26 @@ const AnthropicModule = require('@anthropic-ai/sdk');
 const Anthropic = AnthropicModule.default || AnthropicModule;
 
 const DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5';
+// Fast model for the quick opening line shown before the full answer
+const DEFAULT_QUICK_MODEL = 'claude-haiku-5-5';
 const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const CLAUDE_MAX_TOKENS = 16000;
 
 // Models that accept the server-side refusal fallback (`fallbacks: "default"`).
 const SERVER_FALLBACK_MODELS = new Set(['claude-opus-5-5', 'claude-opus-5', 'claude-fable-5-1', 'claude-sonnet-5-5']);
 const SERVER_FALLBACK_BETA = 'server-side-fallback-2026-07-01';
+
+// How to switch thinking off per model (only used with `fast`, always at effort "low").
+// Opus 5.5 and Fable cannot turn thinking off: they run at low effort instead.
+const THINKING_OFF = {
+    'claude-haiku-5-5': { type: 'disabled' },
+    'claude-sonnet-5-5': { type: 'between_tools' },
+    'claude-sonnet-5': { type: 'disabled' },
+    'claude-opus-5': { type: 'disabled' },
+    'claude-opus-4-8': { type: 'disabled' },
+    'claude-opus-4-7': { type: 'disabled' },
+    'claude-haiku-4-5': { type: 'disabled' },
+};
 
 let cachedClient = null;
 let cachedApiKey = null;
@@ -21,8 +35,8 @@ function getClient(apiKey) {
     return cachedClient;
 }
 
-function normalizeModel(model) {
-    return typeof model === 'string' && model.trim() !== '' ? model.trim() : DEFAULT_CLAUDE_MODEL;
+function normalizeModel(model, fallback = DEFAULT_CLAUDE_MODEL) {
+    return typeof model === 'string' && model.trim() !== '' ? model.trim() : fallback;
 }
 
 function normalizeEffort(effort) {
@@ -51,16 +65,18 @@ function describeClaudeError(error) {
  * @param {Array} options.messages - Anthropic MessageParam[]
  * @param {(text: string) => void} options.onText - called with the full text so far
  * @param {AbortSignal} [options.signal] - aborts the request (throws APIUserAbortError)
+ * @param {boolean} [options.fast] - lowest latency: thinking off where the model allows it, effort "low"
+ * @param {number} [options.maxTokens]
  * @returns {Promise<{ text: string, stopReason: string|null, model: string }>}
  */
-async function streamClaudeResponse({ apiKey, model, effort, system, messages, onText, signal }) {
+async function streamClaudeResponse({ apiKey, model, effort, system, messages, onText, signal, fast = false, maxTokens = CLAUDE_MAX_TOKENS }) {
     const client = getClient(apiKey);
-    const modelId = normalizeModel(model);
-    const effortLevel = normalizeEffort(effort);
+    const modelId = normalizeModel(model, fast ? DEFAULT_QUICK_MODEL : DEFAULT_CLAUDE_MODEL);
+    const effortLevel = fast ? 'low' : normalizeEffort(effort);
 
     const params = {
         model: modelId,
-        max_tokens: CLAUDE_MAX_TOKENS,
+        max_tokens: maxTokens,
         // Explicit breakpoint on the stable system prompt (persona + background) and
         // automatic caching for the growing conversation tail.
         system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
@@ -70,6 +86,9 @@ async function streamClaudeResponse({ apiKey, model, effort, system, messages, o
 
     if (effortLevel) {
         params.output_config = { effort: effortLevel };
+    }
+    if (fast && THINKING_OFF[modelId]) {
+        params.thinking = THINKING_OFF[modelId];
     }
 
     const requestOptions = signal ? { signal } : undefined;
@@ -99,6 +118,7 @@ function isAbortError(error) {
 
 module.exports = {
     DEFAULT_CLAUDE_MODEL,
+    DEFAULT_QUICK_MODEL,
     isAbortError,
     streamClaudeResponse,
     describeClaudeError,

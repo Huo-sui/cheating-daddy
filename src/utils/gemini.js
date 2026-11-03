@@ -13,7 +13,7 @@ const {
     incrementCharUsage,
     getConfig,
 } = require('../storage');
-const { streamClaudeResponse, describeClaudeError, isAbortError } = require('./claude');
+const { streamClaudeResponse, describeClaudeError, isAbortError, DEFAULT_QUICK_MODEL } = require('./claude');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
 
@@ -33,6 +33,7 @@ let groqConversationHistory = [];
 // Claude conversation history (text only) and the prompt Claude answers with
 let claudeConversationHistory = [];
 let currentClaudeSystemPrompt = null;
+let currentClaudeQuickPrompt = null;
 const CLAUDE_MAX_HISTORY_MESSAGES = 40;
 const CLAUDE_REFUSAL_MESSAGE = 'Claude declined to answer this one. Try rephrasing the question.';
 
@@ -40,7 +41,8 @@ const CLAUDE_INPUT_SOURCES = `**WHERE MESSAGES COME FROM:**
 - "Heard:" messages are live speech-to-text of the other side of the call. They can contain transcription errors, and one question can be split across several "Heard:" messages because the speaker paused.
 - The last "Heard:" message may still be in progress: the speaker can be mid-sentence. Speed matters, so as soon as the question is clear, answer it without waiting for the speaker to finish their last words.
 - "Typed:" and "Screenshot:" messages come directly from the user. Always answer them.
-- When several "Heard:" messages arrive in a row, read them as one continuous utterance and answer the complete question they form, once.`;
+- When several "Heard:" messages arrive in a row, read them as one continuous utterance and answer the complete question they form, once.
+- An "Opening:" message comes from the app, not from the other side: the user is already saying that opening out loud. Reply with only the rest of the answer. Continue directly from the opening's last sentence, keep its story, facts and stance, and never repeat, rephrase or contradict it. Never reply [WAIT] to it.`;
 
 const CLAUDE_WAIT_RULES = `**WHEN TO STAY SILENT:**
 - If the latest "Heard:" speech, read together with any unanswered "Heard:" messages before it, does not yet contain a question, request, or point the user needs to respond to, reply with exactly [WAIT] and nothing else.
@@ -49,6 +51,14 @@ const CLAUDE_WAIT_RULES = `**WHEN TO STAY SILENT:**
 - When unsure whether a question was asked, answer: missing a real question is worse than an unneeded answer.
 - Never reply [WAIT] to "Typed:" or "Screenshot:" messages.`;
 
+const CLAUDE_QUICK_RULES = `**QUICK OPENING (your only job in this reply):**
+The user needs something to say within a second. Write only the start of the answer. A fuller answer is written right after yours and continues from your last sentence.
+Reply in exactly this shape and nothing else:
+**Q:** <the question, restated in at most 12 words>
+
+<One or two short spoken sentences that open the answer in the user's voice, grounded in their background: give the direct answer, or name the experience or story you will use. Do not conclude or summarize; leave room to continue.>
+Use the language that <answer_style> asks for, if it sets one.`;
+
 // The Claude prompt adds how to read live transcripts; the wait rules are optional (setting "Only answer questions").
 function buildClaudeSystemPrompt(basePrompt) {
     const sections = [basePrompt, CLAUDE_INPUT_SOURCES];
@@ -56,6 +66,11 @@ function buildClaudeSystemPrompt(basePrompt) {
         sections.push(CLAUDE_WAIT_RULES);
     }
     return sections.join('\n\n');
+}
+
+// Prompt for the fast model that writes the quick opening (question summary + first sentences).
+function buildClaudeQuickPrompt(basePrompt) {
+    return [buildClaudeSystemPrompt(basePrompt), CLAUDE_QUICK_RULES].join('\n\n');
 }
 
 // Conversation tracking variables
@@ -300,13 +315,16 @@ function isWaitMarkerPrefix(text) {
 
 // Streams one Claude reply for `messages`. Text goes to `display` as it arrives, except a reply that is
 // (or may still turn out to be) the wait marker when `allowWait` is set.
-async function streamClaudeReply({ messages, allowWait = false, signal, display }) {
+// `quick` uses the fast model and quick-opening prompt instead of the main model.
+async function streamClaudeReply({ messages, allowWait = false, signal, display, quick = false }) {
     const config = getConfig();
     const result = await streamClaudeResponse({
         apiKey: getAnthropicApiKey(),
-        model: config.anthropicModel,
+        model: quick ? config.quickAnswerModel || DEFAULT_QUICK_MODEL : config.anthropicModel,
         effort: config.anthropicEffort,
-        system: getClaudeSystemPrompt(),
+        system: quick ? currentClaudeQuickPrompt || getClaudeSystemPrompt() : getClaudeSystemPrompt(),
+        fast: quick,
+        maxTokens: quick ? 1024 : undefined,
         messages,
         signal,
         onText: text => {
@@ -460,17 +478,7 @@ function startSpeechDraft(text, committed) {
     logTransportEvent('claude.speech.draft', { text, committed });
     sendToRenderer('update-status', 'Claude is thinking...');
 
-    streamClaudeReply({
-        messages,
-        allowWait: getConfig().answerOnlyQuestions !== false,
-        signal: draft.controller.signal,
-        display: answerText => {
-            if (draft.aborted) return;
-            // Every draft for the same open question overwrites one response instead of adding new ones
-            sendToRenderer(speechBubbleOpen ? 'update-response' : 'new-response', answerText);
-            speechBubbleOpen = true;
-        },
-    })
+    runSpeechAnswer(draft, messages)
         .then(result => {
             if (draft.aborted) return;
             draft.result = result;
@@ -490,6 +498,70 @@ function startSpeechDraft(text, committed) {
             logTransportEvent('claude.speech.error', { error: error.message, stack: error.stack });
             sendToRenderer('update-status', 'Claude error: ' + message);
         });
+}
+
+// Removes the "**Q:** ..." summary line, leaving the spoken opening sentences.
+function extractOpening(quickText) {
+    return quickText
+        .split('\n')
+        .filter(line => !/^\s*(\*\*)?Q(\*\*)?\s*[:：]/.test(line))
+        .join('\n')
+        .trim();
+}
+
+// Answers the speech in `messages`. With the quick opening on (default):
+//   1. the fast model writes "**Q:** summary" + one or two opening sentences, shown within about a second;
+//   2. the main model writes the rest, continuing from that opening, appended below it.
+// Without it, the main model answers in one go. Every draft for the same open question overwrites one
+// response on screen instead of adding new ones.
+async function runSpeechAnswer(draft, messages) {
+    const config = getConfig();
+    const allowWait = config.answerOnlyQuestions !== false;
+    const signal = draft.controller.signal;
+    const show = displayText => {
+        if (draft.aborted) return;
+        sendToRenderer(speechBubbleOpen ? 'update-response' : 'new-response', displayText);
+        speechBubbleOpen = true;
+    };
+
+    let quickText = '';
+    if (config.quickAnswerEnabled !== false) {
+        try {
+            const quick = await streamClaudeReply({ messages, allowWait, signal, display: show, quick: true });
+            if (quick.waited) return quick;
+            if (quick.stopReason !== 'refusal') quickText = quick.answer;
+        } catch (error) {
+            if (isAbortError(error)) throw error;
+            // The opening is a speed-up only: on failure, the main model answers on its own
+            console.error('Quick opening failed:', error);
+            logTransportEvent('claude.speech.quick_error', { error: error.message });
+        }
+    }
+
+    const opening = quickText ? extractOpening(quickText) : '';
+    if (!opening) {
+        const result = await streamClaudeReply({ messages, allowWait, signal, display: show });
+        return { ...result, shown: result.answer, spoken: result.answer };
+    }
+
+    if (!draft.aborted) sendToRenderer('update-status', 'Writing the full answer...');
+    const prefix = `${quickText}\n\n`;
+    const full = await streamClaudeReply({
+        messages: [...messages, { role: 'user', content: `Opening: ${opening}` }],
+        signal,
+        display: continuation => show(prefix + continuation),
+    });
+
+    // If the main model fails to continue, the opening alone is still the answer
+    const continuation = full.stopReason === 'refusal' ? '' : full.answer;
+    return {
+        model: full.model,
+        stopReason: full.stopReason === 'refusal' ? 'end_turn' : full.stopReason,
+        waited: false,
+        answer: continuation ? `${opening}\n\n${continuation}` : opening,
+        shown: continuation ? prefix + continuation : quickText,
+        spoken: continuation ? `${opening}\n\n${continuation}` : opening,
+    };
 }
 
 function finishSpeechDraft(draft) {
@@ -515,11 +587,12 @@ function finishSpeechDraft(draft) {
         return;
     }
 
-    claudeConversationHistory.push({ role: 'assistant', content: result.answer });
-    saveConversationTurn(unansweredSpeech.join(' '), result.answer);
+    // History keeps what the user says (opening + continuation); the saved turn keeps what was shown
+    claudeConversationHistory.push({ role: 'assistant', content: result.spoken || result.answer });
+    saveConversationTurn(unansweredSpeech.join(' '), result.shown || result.answer);
     unansweredSpeech = [];
     speechBubbleOpen = false;
-    logTransportEvent('claude.speech.completed', { model: result.model, response: result.answer });
+    logTransportEvent('claude.speech.completed', { model: result.model, response: result.shown || result.answer });
     sendToRenderer('update-status', 'Listening...');
 }
 
@@ -987,7 +1060,9 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled, background);
     currentSystemPrompt = systemPrompt; // Store for Groq
     // Claude has no Google Search tool here, so build its prompt without the search section
-    currentClaudeSystemPrompt = buildClaudeSystemPrompt(getSystemPrompt(profile, customPrompt, false, background));
+    const claudeBasePrompt = getSystemPrompt(profile, customPrompt, false, background);
+    currentClaudeSystemPrompt = buildClaudeSystemPrompt(claudeBasePrompt);
+    currentClaudeQuickPrompt = buildClaudeQuickPrompt(claudeBasePrompt);
 
     // Initialize new conversation session only on first connect
     if (!isReconnect) {
