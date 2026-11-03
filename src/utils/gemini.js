@@ -3,7 +3,17 @@ const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig } = require('../storage');
+const {
+    getAvailableModel,
+    incrementLimitCount,
+    getApiKey,
+    getGroqApiKey,
+    getAnthropicApiKey,
+    getUserBackground,
+    incrementCharUsage,
+    getConfig,
+} = require('../storage');
+const { streamClaudeResponse, describeClaudeError } = require('./claude');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
 
@@ -19,6 +29,12 @@ let currentProviderMode = 'byok';
 
 // Groq conversation history for context
 let groqConversationHistory = [];
+
+// Claude conversation history (text only) and the prompt Claude answers with
+let claudeConversationHistory = [];
+let currentClaudeSystemPrompt = null;
+const CLAUDE_MAX_HISTORY_MESSAGES = 40;
+const CLAUDE_REFUSAL_MESSAGE = 'Claude declined to answer this one. Try rephrasing the question.';
 
 // Conversation tracking variables
 let currentSessionId = null;
@@ -87,6 +103,7 @@ function initializeNewSession(profile = null, customPrompt = null) {
     conversationHistory = [];
     screenAnalysisHistory = [];
     groqConversationHistory = [];
+    claudeConversationHistory = [];
     currentProfile = profile;
     currentCustomPrompt = customPrompt;
     console.log('New conversation session started:', currentSessionId, 'profile:', profile);
@@ -211,8 +228,27 @@ function hasGroqKey() {
     return key && key.trim() != '';
 }
 
-function sendFinalTranscriptionToGroq() {
-    if (!hasGroqKey() || groqRequestStartedForTurn) {
+// helper to check if Anthropic (Claude) has been configured
+function hasClaudeKey() {
+    const key = getAnthropicApiKey();
+    return !!key && key.trim() !== '';
+}
+
+// When Claude or Groq is configured, Gemini Live only transcribes and the answer comes from that model.
+// Claude takes priority over Groq.
+function hasExternalAnswerEngine() {
+    return hasClaudeKey() || hasGroqKey();
+}
+
+function sendTextToAnswerEngine(text) {
+    if (hasClaudeKey()) {
+        return sendToClaude(text);
+    }
+    return sendToGroq(text);
+}
+
+function sendFinalTranscriptionToAnswerEngine() {
+    if (!hasExternalAnswerEngine() || groqRequestStartedForTurn) {
         return;
     }
 
@@ -222,7 +258,123 @@ function sendFinalTranscriptionToGroq() {
     }
 
     groqRequestStartedForTurn = true;
-    sendToGroq(transcription);
+    sendTextToAnswerEngine(transcription);
+}
+
+function trimClaudeHistory() {
+    if (claudeConversationHistory.length > CLAUDE_MAX_HISTORY_MESSAGES) {
+        claudeConversationHistory = claudeConversationHistory.slice(-CLAUDE_MAX_HISTORY_MESSAGES);
+    }
+    // The conversation must start with a user message
+    while (claudeConversationHistory.length > 0 && claudeConversationHistory[0].role !== 'user') {
+        claudeConversationHistory.shift();
+    }
+}
+
+function removeClaudeMessage(message) {
+    const index = claudeConversationHistory.indexOf(message);
+    if (index !== -1) {
+        claudeConversationHistory.splice(index, 1);
+    }
+}
+
+function getClaudeSystemPrompt() {
+    return currentClaudeSystemPrompt || currentSystemPrompt || 'You are a helpful assistant.';
+}
+
+// Runs one Claude turn: streams the answer to the UI and records it in both histories.
+// `userContent` is what Claude sees for this turn; `historyText` is the text-only version kept for later turns.
+async function runClaudeTurn({ userContent, historyText, logPrefix, onSaved }) {
+    const apiKey = getAnthropicApiKey();
+    const config = getConfig();
+    const model = config.anthropicModel;
+
+    const historyMessage = { role: 'user', content: historyText };
+    claudeConversationHistory.push(historyMessage);
+    trimClaudeHistory();
+
+    // Send the history with this turn's full content (e.g. an image) in place of the text-only copy
+    const messages = claudeConversationHistory.map(message => (message === historyMessage ? { role: 'user', content: userContent } : message));
+
+    logTransportEvent(`${logPrefix}.request`, { model, text: historyText });
+    sendToRenderer('update-status', 'Claude is thinking...');
+
+    try {
+        let isFirst = true;
+        const result = await streamClaudeResponse({
+            apiKey,
+            model,
+            effort: config.anthropicEffort,
+            system: getClaudeSystemPrompt(),
+            messages,
+            onText: text => {
+                sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
+                isFirst = false;
+            },
+        });
+
+        if (result.stopReason === 'refusal') {
+            removeClaudeMessage(historyMessage);
+            logTransportEvent(`${logPrefix}.refusal`, { model: result.model });
+            sendToRenderer(isFirst ? 'new-response' : 'update-response', CLAUDE_REFUSAL_MESSAGE);
+            sendToRenderer('update-status', 'Listening...');
+            return { success: false, error: CLAUDE_REFUSAL_MESSAGE };
+        }
+
+        const answer = result.text.trim();
+        if (!answer) {
+            removeClaudeMessage(historyMessage);
+            sendToRenderer('update-status', 'Listening...');
+            return { success: false, error: 'Claude returned an empty answer' };
+        }
+
+        claudeConversationHistory.push({ role: 'assistant', content: answer });
+        onSaved(answer, result.model);
+        logTransportEvent(`${logPrefix}.completed`, { model: result.model, response: answer, stopReason: result.stopReason });
+        sendToRenderer('update-status', 'Listening...');
+        return { success: true, text: answer, model: result.model };
+    } catch (error) {
+        removeClaudeMessage(historyMessage);
+        const message = describeClaudeError(error);
+        console.error('Error calling Claude API:', error);
+        logTransportEvent(`${logPrefix}.error`, { error: error.message, stack: error.stack });
+        sendToRenderer('update-status', 'Claude error: ' + message);
+        return { success: false, error: message };
+    }
+}
+
+async function sendToClaude(transcription) {
+    if (!hasClaudeKey()) {
+        console.log('No Anthropic API key configured, skipping Claude response');
+        return { success: false, error: 'No Anthropic API key configured' };
+    }
+
+    const text = (transcription || '').trim();
+    if (text === '') {
+        return { success: false, error: 'Empty transcription' };
+    }
+
+    console.log('Sending to Claude:', text.substring(0, 100) + '...');
+    return runClaudeTurn({
+        userContent: text,
+        historyText: text,
+        logPrefix: 'claude.text',
+        onSaved: answer => saveConversationTurn(text, answer),
+    });
+}
+
+async function sendImageToClaude(base64Data, prompt) {
+    const promptText = (prompt || '').trim() || 'Help me with what is on the screen.';
+
+    return runClaudeTurn({
+        userContent: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Data } },
+            { type: 'text', text: promptText },
+        ],
+        historyText: `[Shared a screenshot] ${promptText}`,
+        logPrefix: 'claude.image',
+        onSaved: (answer, model) => saveScreenAnalysis(promptText, answer, model),
+    });
 }
 
 function trimConversationHistoryForGemma(history, maxChars = 42000) {
@@ -653,8 +805,11 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     const enabledTools = await getEnabledTools();
     const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
 
-    const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
+    const background = getUserBackground();
+    const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled, background);
     currentSystemPrompt = systemPrompt; // Store for Groq
+    // Claude has no Google Search tool here, so build its prompt without the search section
+    currentClaudeSystemPrompt = getSystemPrompt(profile, customPrompt, false, background);
 
     // Initialize new conversation session only on first connect
     if (!isReconnect) {
@@ -684,10 +839,10 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     }
 
                     if (message.serverContent?.inputTranscription) {
-                        sendFinalTranscriptionToGroq();
+                        sendFinalTranscriptionToAnswerEngine();
                     }
 
-                    if (!hasGroqKey() && message.serverContent?.outputTranscription?.text) {
+                    if (!hasExternalAnswerEngine() && message.serverContent?.outputTranscription?.text) {
                         const isFirstChunk = messageBuffer === '';
                         messageBuffer += message.serverContent.outputTranscription.text;
                         sendToRenderer(isFirstChunk ? 'new-response' : 'update-response', messageBuffer);
@@ -695,7 +850,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
                     if (message.serverContent?.generationComplete) {
                         if (currentTranscription.trim() !== '') {
-                            if (!hasGroqKey() && messageBuffer.trim() !== '') {
+                            if (!hasExternalAnswerEngine() && messageBuffer.trim() !== '') {
                                 saveConversationTurn(currentTranscription, messageBuffer);
                             }
                             currentTranscription = '';
@@ -1197,6 +1352,10 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return result;
             }
 
+            if (hasClaudeKey()) {
+                return await sendImageToClaude(data, prompt);
+            }
+
             const result = hasGroqKey() ? await sendImageToGroq(data, prompt) : await sendImageToGeminiHttp(data, prompt);
             return result;
         } catch (error) {
@@ -1236,9 +1395,9 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         try {
             console.log('Sending text message:', text);
 
-            if (hasGroqKey()) {
+            if (hasExternalAnswerEngine()) {
                 groqRequestStartedForTurn = true;
-                sendToGroq(text.trim());
+                sendTextToAnswerEngine(text.trim());
             }
 
             await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
@@ -1360,6 +1519,8 @@ module.exports = {
     stopMacOSAudioCapture,
     sendAudioToGemini,
     sendImageToGeminiHttp,
+    sendToClaude,
+    sendImageToClaude,
     setupGeminiIpcHandlers,
     formatSpeakerResults,
 };

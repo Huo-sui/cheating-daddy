@@ -697,6 +697,9 @@ export class MainView extends LitElement {
         _token: { state: true },
         _geminiKey: { state: true },
         _groqKey: { state: true },
+        _anthropicKey: { state: true },
+        _anthropicModel: { state: true },
+        _anthropicEffort: { state: true },
         _openaiKey: { state: true },
         _geminiLiveModel: { state: true },
         _groqModel: { state: true },
@@ -726,6 +729,9 @@ export class MainView extends LitElement {
         this._token = '';
         this._geminiKey = '';
         this._groqKey = '';
+        this._anthropicKey = '';
+        this._anthropicModel = 'claude-opus-5-5';
+        this._anthropicEffort = 'low';
         this._openaiKey = '';
         this._geminiLiveModel = 'gemini-3.1-flash-live-preview';
         this._groqModel = 'qwen/qwen3.6-27b';
@@ -766,6 +772,9 @@ export class MainView extends LitElement {
             this._token = creds.cloudToken || '';
             this._geminiKey = (await cheatingDaddy.storage.getApiKey().catch(() => '')) || '';
             this._groqKey = (await cheatingDaddy.storage.getGroqApiKey().catch(() => '')) || '';
+            this._anthropicKey = (await cheatingDaddy.storage.getAnthropicApiKey().catch(() => '')) || '';
+            this._anthropicModel = config.anthropicModel || 'claude-opus-5-5';
+            this._anthropicEffort = config.anthropicEffort || 'low';
             this._openaiKey = creds.openaiKey || '';
             this._geminiLiveModel = config.geminiLiveModel || 'gemini-3.1-flash-live-preview';
             this._groqModel = config.groqModel || 'qwen/qwen3.6-27b';
@@ -945,6 +954,24 @@ export class MainView extends LitElement {
         this.requestUpdate();
     }
 
+    async _saveAnthropicKey(val) {
+        this._anthropicKey = val;
+        await cheatingDaddy.storage.setAnthropicApiKey(val);
+        this.requestUpdate();
+    }
+
+    async _saveAnthropicModel(val) {
+        this._anthropicModel = val;
+        await cheatingDaddy.storage.updateConfig('anthropicModel', val.trim() || 'claude-opus-5-5');
+        this.requestUpdate();
+    }
+
+    async _saveAnthropicEffort(val) {
+        this._anthropicEffort = val;
+        await cheatingDaddy.storage.updateConfig('anthropicEffort', val);
+        this.requestUpdate();
+    }
+
     async _saveGeminiLiveModel(val) {
         this._geminiLiveModel = val;
         await cheatingDaddy.storage.updateConfig('geminiLiveModel', val);
@@ -1106,29 +1133,25 @@ export class MainView extends LitElement {
             >
                 <canvas class="btn-aurora"></canvas>
                 <canvas class="btn-dither"></canvas>
-                ${
-                    isDownloading
-                        ? html`<span
-                              class="download-progress-fill ${hasPercentage ? '' : 'indeterminate'}"
-                              style=${hasPercentage ? `width: ${percentage}%` : ''}
-                          ></span>`
-                        : ''
-                }
+                ${isDownloading
+                    ? html`<span
+                          class="download-progress-fill ${hasPercentage ? '' : 'indeterminate'}"
+                          style=${hasPercentage ? `width: ${percentage}%` : ''}
+                      ></span>`
+                    : ''}
                 <span class="btn-label">
                     ${isDownloading ? (hasPercentage ? `${percentage}%` : 'Preparing...') : 'Start Session'}
                     ${isDownloading ? '' : html`<span class="shortcut-hint">${isMac ? cmdIcon : ctrlIcon}${enterIcon}</span>`}
                 </span>
             </button>
-            ${
-                isDownloading
-                    ? html`
-                          <div class="download-controls">
-                              <span>Downloading: ${this.downloadProgress.label || 'Local AI files'}</span>
-                              <button class="download-cancel" @click=${() => this.onCancelDownload()}>Cancel</button>
-                          </div>
-                      `
-                    : ''
-            }
+            ${isDownloading
+                ? html`
+                      <div class="download-controls">
+                          <span>Downloading: ${this.downloadProgress.label || 'Local AI files'}</span>
+                          <button class="download-cancel" @click=${() => this.onCancelDownload()}>Cancel</button>
+                      </div>
+                  `
+                : ''}
         `;
     }
 
@@ -1162,7 +1185,7 @@ export class MainView extends LitElement {
                 <summary class="config-summary">
                     <span class="config-summary-text">
                         <span class="config-summary-title">Transcription</span>
-                        <span class="config-summary-description">Gemini Live connection</span>
+                        <span class="config-summary-description">Gemini Live listens and transcribes</span>
                     </span>
                     ${this._renderConfigChevron()}
                 </summary>
@@ -1188,11 +1211,55 @@ export class MainView extends LitElement {
                 </div>
             </details>
 
+            <details class="config-section" open>
+                <summary class="config-summary">
+                    <span class="config-summary-text">
+                        <span class="config-summary-title">AI responses (Claude)</span>
+                        <span class="config-summary-description">Anthropic key and answer model</span>
+                    </span>
+                    ${this._renderConfigChevron()}
+                </summary>
+                <div class="config-content">
+                    <div class="form-group">
+                        <label class="form-label">Anthropic API Key</label>
+                        <input
+                            type="password"
+                            placeholder="Recommended"
+                            .value=${this._anthropicKey}
+                            @input=${e => this._saveAnthropicKey(e.target.value)}
+                        />
+                        <div class="form-hint">
+                            <span class="link" @click=${() => this.onExternalLink('https://platform.claude.com/settings/keys')}
+                                >Get Anthropic key</span
+                            >
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Claude Model</label>
+                        <input type="text" .value=${this._anthropicModel} @input=${e => this._saveAnthropicModel(e.target.value)} />
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Answer depth</label>
+                        <select .value=${this._anthropicEffort} @change=${e => this._saveAnthropicEffort(e.target.value)}>
+                            <option value="low" ?selected=${this._anthropicEffort === 'low'}>Fast (best for live conversations)</option>
+                            <option value="medium" ?selected=${this._anthropicEffort === 'medium'}>Balanced</option>
+                            <option value="high" ?selected=${this._anthropicEffort === 'high'}>Deep (slower, for hard questions)</option>
+                        </select>
+                    </div>
+
+                    <div class="config-note">
+                        With an Anthropic key, Claude writes every answer using your background from the AI Context page. Gemini only transcribes.
+                    </div>
+                </div>
+            </details>
+
             <details class="config-section">
                 <summary class="config-summary">
                     <span class="config-summary-text">
-                        <span class="config-summary-title">AI responses</span>
-                        <span class="config-summary-description">Groq key and response model</span>
+                        <span class="config-summary-title">Alternative: Groq</span>
+                        <span class="config-summary-description">Used only when no Anthropic key is set</span>
                     </span>
                     ${this._renderConfigChevron()}
                 </summary>
@@ -1228,7 +1295,7 @@ export class MainView extends LitElement {
                     </label>
 
                     <div class="config-note">
-                        If the Groq API key is empty, Gemini Live is used for answers instead. Its answer quality may be lower.
+                        If both the Anthropic and Groq keys are empty, Gemini Live is used for answers instead. Its answer quality may be lower.
                     </div>
                 </div>
             </details>
@@ -1265,18 +1332,16 @@ export class MainView extends LitElement {
                             ${LOCAL_LLM_PRESETS.map(preset => html`<option value=${preset.value}>${preset.label}</option>`)}
                             <option value="custom">Custom Hugging Face model or local GGUF…</option>
                         </select>
-                        ${
-                            this._useCustomLocalLlmModel
-                                ? html`
-                                      <input
-                                          type="text"
-                                          placeholder="owner/repository:quant or /absolute/model.gguf"
-                                          .value=${this._localLlmModel}
-                                          @input=${event => this._saveLocalLlmModel(event.target.value)}
-                                      />
-                                  `
-                                : ''
-                        }
+                        ${this._useCustomLocalLlmModel
+                            ? html`
+                                  <input
+                                      type="text"
+                                      placeholder="owner/repository:quant or /absolute/model.gguf"
+                                      .value=${this._localLlmModel}
+                                      @input=${event => this._saveLocalLlmModel(event.target.value)}
+                                  />
+                              `
+                            : ''}
                         <div class="form-hint">Sizes include the vision model. Q4 uses less memory; Q8 preserves more quality.</div>
                     </div>
                 </div>
@@ -1331,16 +1396,14 @@ export class MainView extends LitElement {
 
         return html`
             <div class="form-wrapper">
-                ${
-                    this._mode === 'local'
-                        ? html`
-                              <div class="title-row">
-                                  <div class="page-title">Cheating Daddy <span class="mode-suffix">Local AI</span></div>
-                                  <button class="help-btn" @click=${this._openLocalHelp} aria-label="Open Local AI help">${helpIcon}</button>
-                              </div>
-                          `
-                        : html` <div class="page-title">${html`Cheating Daddy <span class="mode-suffix">BYOK</span>`}</div> `
-                }
+                ${this._mode === 'local'
+                    ? html`
+                          <div class="title-row">
+                              <div class="page-title">Cheating Daddy <span class="mode-suffix">Local AI</span></div>
+                              <button class="help-btn" @click=${this._openLocalHelp} aria-label="Open Local AI help">${helpIcon}</button>
+                          </div>
+                      `
+                    : html` <div class="page-title">${html`Cheating Daddy <span class="mode-suffix">BYOK</span>`}</div> `}
                 <div class="page-subtitle">${this._mode === 'byok' ? 'Bring your own API keys' : 'Run models locally on your machine'}</div>
 
                 <!-- Cloud mode render branch intentionally disabled. -->

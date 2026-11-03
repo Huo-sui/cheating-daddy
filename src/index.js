@@ -138,6 +138,28 @@ function setupStorageIpcHandlers() {
         }
     });
 
+    ipcMain.handle('storage:get-anthropic-api-key', async () => {
+        try {
+            return { success: true, data: storage.getAnthropicApiKey() };
+        } catch (error) {
+            console.error('Error getting Anthropic API key:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('storage:set-anthropic-api-key', async (event, anthropicApiKey) => {
+        try {
+            if (typeof anthropicApiKey !== 'string') {
+                return { success: false, error: 'Invalid Anthropic API key' };
+            }
+            storage.setAnthropicApiKey(anthropicApiKey.trim());
+            return { success: true };
+        } catch (error) {
+            console.error('Error setting Anthropic API key:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
     // ============ PREFERENCES ============
     ipcMain.handle('storage:get-preferences', async () => {
         try {
