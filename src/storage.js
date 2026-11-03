@@ -15,6 +15,8 @@ const DEFAULT_CONFIG = {
     disableGroqThinking: true,
     anthropicModel: 'claude-opus-5-5',
     anthropicEffort: 'low',
+    // Claude skips small talk and waits until a question is complete before answering
+    answerOnlyQuestions: true,
 };
 
 const DEFAULT_CREDENTIALS = {

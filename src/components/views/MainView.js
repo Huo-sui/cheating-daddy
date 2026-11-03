@@ -700,6 +700,7 @@ export class MainView extends LitElement {
         _anthropicKey: { state: true },
         _anthropicModel: { state: true },
         _anthropicEffort: { state: true },
+        _answerOnlyQuestions: { state: true },
         _openaiKey: { state: true },
         _geminiLiveModel: { state: true },
         _groqModel: { state: true },
@@ -732,6 +733,7 @@ export class MainView extends LitElement {
         this._anthropicKey = '';
         this._anthropicModel = 'claude-opus-5-5';
         this._anthropicEffort = 'low';
+        this._answerOnlyQuestions = true;
         this._openaiKey = '';
         this._geminiLiveModel = 'gemini-3.1-flash-live-preview';
         this._groqModel = 'qwen/qwen3.6-27b';
@@ -775,6 +777,7 @@ export class MainView extends LitElement {
             this._anthropicKey = (await cheatingDaddy.storage.getAnthropicApiKey().catch(() => '')) || '';
             this._anthropicModel = config.anthropicModel || 'claude-opus-5-5';
             this._anthropicEffort = config.anthropicEffort || 'low';
+            this._answerOnlyQuestions = config.answerOnlyQuestions !== false;
             this._openaiKey = creds.openaiKey || '';
             this._geminiLiveModel = config.geminiLiveModel || 'gemini-3.1-flash-live-preview';
             this._groqModel = config.groqModel || 'qwen/qwen3.6-27b';
@@ -969,6 +972,12 @@ export class MainView extends LitElement {
     async _saveAnthropicEffort(val) {
         this._anthropicEffort = val;
         await cheatingDaddy.storage.updateConfig('anthropicEffort', val);
+        this.requestUpdate();
+    }
+
+    async _saveAnswerOnlyQuestions(enabled) {
+        this._answerOnlyQuestions = enabled;
+        await cheatingDaddy.storage.updateConfig('answerOnlyQuestions', enabled);
         this.requestUpdate();
     }
 
@@ -1248,6 +1257,18 @@ export class MainView extends LitElement {
                             <option value="high" ?selected=${this._anthropicEffort === 'high'}>Deep (slower, for hard questions)</option>
                         </select>
                     </div>
+
+                    <label class="config-checkbox">
+                        <input
+                            type="checkbox"
+                            .checked=${this._answerOnlyQuestions}
+                            @change=${e => this._saveAnswerOnlyQuestions(e.target.checked)}
+                        />
+                        <span class="config-checkbox-text">
+                            <span class="config-summary-title">Only answer questions</span>
+                            <span class="config-summary-description">Skip small talk and wait until a question is finished</span>
+                        </span>
+                    </label>
 
                     <div class="config-note">
                         With an Anthropic key, Claude writes every answer using your background from the AI Context page. Gemini only transcribes.

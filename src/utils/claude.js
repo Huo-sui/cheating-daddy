@@ -50,9 +50,10 @@ function describeClaudeError(error) {
  * @param {string} options.system - system prompt (stable per session, so it is cached)
  * @param {Array} options.messages - Anthropic MessageParam[]
  * @param {(text: string) => void} options.onText - called with the full text so far
+ * @param {AbortSignal} [options.signal] - aborts the request (throws APIUserAbortError)
  * @returns {Promise<{ text: string, stopReason: string|null, model: string }>}
  */
-async function streamClaudeResponse({ apiKey, model, effort, system, messages, onText }) {
+async function streamClaudeResponse({ apiKey, model, effort, system, messages, onText, signal }) {
     const client = getClient(apiKey);
     const modelId = normalizeModel(model);
     const effortLevel = normalizeEffort(effort);
@@ -71,9 +72,10 @@ async function streamClaudeResponse({ apiKey, model, effort, system, messages, o
         params.output_config = { effort: effortLevel };
     }
 
+    const requestOptions = signal ? { signal } : undefined;
     const stream = SERVER_FALLBACK_MODELS.has(modelId)
-        ? client.beta.messages.stream({ ...params, betas: [SERVER_FALLBACK_BETA], fallbacks: 'default' })
-        : client.messages.stream(params);
+        ? client.beta.messages.stream({ ...params, betas: [SERVER_FALLBACK_BETA], fallbacks: 'default' }, requestOptions)
+        : client.messages.stream(params, requestOptions);
 
     let text = '';
     for await (const event of stream) {
@@ -91,8 +93,13 @@ async function streamClaudeResponse({ apiKey, model, effort, system, messages, o
     };
 }
 
+function isAbortError(error) {
+    return error instanceof Anthropic.APIUserAbortError || error?.name === 'AbortError';
+}
+
 module.exports = {
     DEFAULT_CLAUDE_MODEL,
+    isAbortError,
     streamClaudeResponse,
     describeClaudeError,
 };

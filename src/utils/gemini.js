@@ -13,7 +13,7 @@ const {
     incrementCharUsage,
     getConfig,
 } = require('../storage');
-const { streamClaudeResponse, describeClaudeError } = require('./claude');
+const { streamClaudeResponse, describeClaudeError, isAbortError } = require('./claude');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
 
@@ -35,6 +35,27 @@ let claudeConversationHistory = [];
 let currentClaudeSystemPrompt = null;
 const CLAUDE_MAX_HISTORY_MESSAGES = 40;
 const CLAUDE_REFUSAL_MESSAGE = 'Claude declined to answer this one. Try rephrasing the question.';
+
+const CLAUDE_INPUT_SOURCES = `**WHERE MESSAGES COME FROM:**
+- "Heard:" messages are live speech-to-text of the other side of the call. They can contain transcription errors, and one question can be split across several "Heard:" messages because the speaker paused.
+- "Typed:" and "Screenshot:" messages come directly from the user. Always answer them.
+- When several "Heard:" messages arrive in a row, read them as one continuous utterance and answer the complete question they form, once.`;
+
+const CLAUDE_WAIT_RULES = `**WHEN TO STAY SILENT:**
+- If the latest "Heard:" speech, read together with any unanswered "Heard:" messages before it, does not yet contain a question, request, or point the user needs to respond to, reply with exactly [WAIT] and nothing else.
+- Reply [WAIT] for audio checks ("Can you hear me?"), acknowledgements ("Great, thanks", "Okay"), remarks not addressed to the user, and when the speaker is still giving context or stopped mid-sentence.
+- A greeting or small-talk question addressed to the user ("Hi, how are you?") gets a short, natural reply, not [WAIT].
+- When unsure whether a question was asked, answer: missing a real question is worse than an unneeded answer.
+- Never reply [WAIT] to "Typed:" or "Screenshot:" messages.`;
+
+// The Claude prompt adds how to read live transcripts; the wait rules are optional (setting "Only answer questions").
+function buildClaudeSystemPrompt(basePrompt) {
+    const sections = [basePrompt, CLAUDE_INPUT_SOURCES];
+    if (getConfig().answerOnlyQuestions !== false) {
+        sections.push(CLAUDE_WAIT_RULES);
+    }
+    return sections.join('\n\n');
+}
 
 // Conversation tracking variables
 let currentSessionId = null;
@@ -62,7 +83,6 @@ module.exports.formatSpeakerResults = formatSpeakerResults;
 // Audio capture variables
 let systemAudioProc = null;
 let messageBuffer = '';
-let groqRequestStartedForTurn = false;
 
 const GROQ_MAX_COMPLETION_TOKENS = 16384;
 const GROQ_EMPTY_RESPONSE_MESSAGE =
@@ -99,7 +119,8 @@ function initializeNewSession(profile = null, customPrompt = null) {
     currentSessionId = Date.now().toString();
     startTransportLog(currentSessionId);
     currentTranscription = '';
-    groqRequestStartedForTurn = false;
+    resetPendingUtterance();
+    resetClaudeSpeechState();
     conversationHistory = [];
     screenAnalysisHistory = [];
     groqConversationHistory = [];
@@ -240,25 +261,47 @@ function hasExternalAnswerEngine() {
     return hasClaudeKey() || hasGroqKey();
 }
 
-function sendTextToAnswerEngine(text) {
+function sendTypedTextToAnswerEngine(text) {
     if (hasClaudeKey()) {
-        return sendToClaude(text);
+        return sendTypedTextToClaude(text);
     }
     return sendToGroq(text);
 }
 
-function sendFinalTranscriptionToAnswerEngine() {
-    if (!hasExternalAnswerEngine() || groqRequestStartedForTurn) {
-        return;
-    }
+// ---- Live speech hand-off ----
+// Gemini delivers the transcript in fragments while the other person speaks. Instead of answering the
+// first fragment, collect fragments until the transcript has been quiet for UTTERANCE_SILENCE_MS and
+// hand the whole utterance to the answer engine.
+const UTTERANCE_SILENCE_MS = 1000;
+let pendingUtterance = '';
+let utteranceTimer = null;
 
-    const transcription = currentTranscription.trim();
-    if (transcription === '') {
-        return;
-    }
+function queueTranscriptFragment(fragment) {
+    if (!fragment || fragment.trim() === '') return;
+    pendingUtterance += fragment;
+    if (utteranceTimer) clearTimeout(utteranceTimer);
+    utteranceTimer = setTimeout(flushPendingUtterance, UTTERANCE_SILENCE_MS);
+}
 
-    groqRequestStartedForTurn = true;
-    sendTextToAnswerEngine(transcription);
+function flushPendingUtterance() {
+    if (utteranceTimer) clearTimeout(utteranceTimer);
+    utteranceTimer = null;
+
+    const utterance = pendingUtterance.trim();
+    pendingUtterance = '';
+    if (utterance === '' || !hasExternalAnswerEngine()) return;
+
+    if (hasClaudeKey()) {
+        sendSpeechToClaude(utterance);
+    } else {
+        sendToGroq(utterance);
+    }
+}
+
+function resetPendingUtterance() {
+    if (utteranceTimer) clearTimeout(utteranceTimer);
+    utteranceTimer = null;
+    pendingUtterance = '';
 }
 
 function trimClaudeHistory() {
@@ -282,9 +325,19 @@ function getClaudeSystemPrompt() {
     return currentClaudeSystemPrompt || currentSystemPrompt || 'You are a helpful assistant.';
 }
 
+// Claude replies with this marker when the speech so far needs no answer yet (see CLAUDE_LIVE_RULES).
+const CLAUDE_WAIT_MARKER = '[WAIT]';
+
+function isWaitMarkerPrefix(text) {
+    const trimmed = text.trimStart();
+    return CLAUDE_WAIT_MARKER.startsWith(trimmed) || trimmed.startsWith(CLAUDE_WAIT_MARKER);
+}
+
 // Runs one Claude turn: streams the answer to the UI and records it in both histories.
 // `userContent` is what Claude sees for this turn; `historyText` is the text-only version kept for later turns.
-async function runClaudeTurn({ userContent, historyText, logPrefix, onSaved }) {
+// With `allowWait`, a reply of CLAUDE_WAIT_MARKER is hidden and the user message is kept, so the next
+// utterance is read together with it. With `keepOnFailure`, the user message also stays after an abort or error.
+async function runClaudeTurn({ userContent, historyText, logPrefix, onSaved, allowWait = false, keepOnFailure = false, signal }) {
     const apiKey = getAnthropicApiKey();
     const config = getConfig();
     const model = config.anthropicModel;
@@ -299,31 +352,45 @@ async function runClaudeTurn({ userContent, historyText, logPrefix, onSaved }) {
     logTransportEvent(`${logPrefix}.request`, { model, text: historyText });
     sendToRenderer('update-status', 'Claude is thinking...');
 
+    let isFirst = true;
+    const showText = text => {
+        sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
+        isFirst = false;
+    };
+
     try {
-        let isFirst = true;
         const result = await streamClaudeResponse({
             apiKey,
             model,
             effort: config.anthropicEffort,
             system: getClaudeSystemPrompt(),
             messages,
+            signal,
             onText: text => {
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
-                isFirst = false;
+                // Hold output back while it may still turn out to be the wait marker
+                if (allowWait && isWaitMarkerPrefix(text)) return;
+                showText(text);
             },
         });
 
         if (result.stopReason === 'refusal') {
             removeClaudeMessage(historyMessage);
             logTransportEvent(`${logPrefix}.refusal`, { model: result.model });
-            sendToRenderer(isFirst ? 'new-response' : 'update-response', CLAUDE_REFUSAL_MESSAGE);
+            showText(CLAUDE_REFUSAL_MESSAGE);
             sendToRenderer('update-status', 'Listening...');
             return { success: false, error: CLAUDE_REFUSAL_MESSAGE };
         }
 
         const answer = result.text.trim();
+
+        if (allowWait && answer.startsWith(CLAUDE_WAIT_MARKER)) {
+            logTransportEvent(`${logPrefix}.wait`, { model: result.model, text: historyText });
+            sendToRenderer('update-status', 'Listening... (no question yet)');
+            return { success: true, waited: true };
+        }
+
         if (!answer) {
-            removeClaudeMessage(historyMessage);
+            if (!keepOnFailure) removeClaudeMessage(historyMessage);
             sendToRenderer('update-status', 'Listening...');
             return { success: false, error: 'Claude returned an empty answer' };
         }
@@ -334,7 +401,14 @@ async function runClaudeTurn({ userContent, historyText, logPrefix, onSaved }) {
         sendToRenderer('update-status', 'Listening...');
         return { success: true, text: answer, model: result.model };
     } catch (error) {
-        removeClaudeMessage(historyMessage);
+        if (isAbortError(error)) {
+            // Superseded by a newer utterance; that request answers with this message as context
+            if (!keepOnFailure) removeClaudeMessage(historyMessage);
+            logTransportEvent(`${logPrefix}.superseded`, { text: historyText });
+            return { success: false, aborted: true };
+        }
+
+        if (!keepOnFailure) removeClaudeMessage(historyMessage);
         const message = describeClaudeError(error);
         console.error('Error calling Claude API:', error);
         logTransportEvent(`${logPrefix}.error`, { error: error.message, stack: error.stack });
@@ -343,24 +417,57 @@ async function runClaudeTurn({ userContent, historyText, logPrefix, onSaved }) {
     }
 }
 
-async function sendToClaude(transcription) {
-    if (!hasClaudeKey()) {
-        console.log('No Anthropic API key configured, skipping Claude response');
-        return { success: false, error: 'No Anthropic API key configured' };
-    }
+// Speech heard since the last answered question; saved together as one history entry.
+let unansweredSpeech = [];
+let activeSpeechController = null;
 
-    const text = (transcription || '').trim();
-    if (text === '') {
-        return { success: false, error: 'Empty transcription' };
-    }
+async function sendSpeechToClaude(utterance) {
+    const text = (utterance || '').trim();
+    if (text === '' || !hasClaudeKey()) return { success: false, error: 'Nothing to send' };
 
-    console.log('Sending to Claude:', text.substring(0, 100) + '...');
+    // A new utterance replaces an answer still in progress: the new request sees both utterances
+    // in the history, so a question split by a pause is answered once, as a whole.
+    if (activeSpeechController) activeSpeechController.abort();
+    const controller = new AbortController();
+    activeSpeechController = controller;
+
+    unansweredSpeech.push(text);
+    console.log('Sending speech to Claude:', text.substring(0, 100) + '...');
+
+    const result = await runClaudeTurn({
+        userContent: `Heard: ${text}`,
+        historyText: `Heard: ${text}`,
+        logPrefix: 'claude.speech',
+        allowWait: getConfig().answerOnlyQuestions !== false,
+        keepOnFailure: true,
+        signal: controller.signal,
+        onSaved: answer => {
+            saveConversationTurn(unansweredSpeech.join(' '), answer);
+            unansweredSpeech = [];
+        },
+    });
+
+    if (activeSpeechController === controller) activeSpeechController = null;
+    return result;
+}
+
+async function sendTypedTextToClaude(typedText) {
+    const text = (typedText || '').trim();
+    if (text === '' || !hasClaudeKey()) return { success: false, error: 'Nothing to send' };
+
+    console.log('Sending typed text to Claude:', text.substring(0, 100) + '...');
     return runClaudeTurn({
-        userContent: text,
-        historyText: text,
+        userContent: `Typed: ${text}`,
+        historyText: `Typed: ${text}`,
         logPrefix: 'claude.text',
         onSaved: answer => saveConversationTurn(text, answer),
     });
+}
+
+function resetClaudeSpeechState() {
+    if (activeSpeechController) activeSpeechController.abort();
+    activeSpeechController = null;
+    unansweredSpeech = [];
 }
 
 async function sendImageToClaude(base64Data, prompt) {
@@ -369,9 +476,9 @@ async function sendImageToClaude(base64Data, prompt) {
     return runClaudeTurn({
         userContent: [
             { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Data } },
-            { type: 'text', text: promptText },
+            { type: 'text', text: `Screenshot: ${promptText}` },
         ],
-        historyText: `[Shared a screenshot] ${promptText}`,
+        historyText: `Screenshot: [image not kept] ${promptText}`,
         logPrefix: 'claude.image',
         onSaved: (answer, model) => saveScreenAnalysis(promptText, answer, model),
     });
@@ -809,7 +916,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled, background);
     currentSystemPrompt = systemPrompt; // Store for Groq
     // Claude has no Google Search tool here, so build its prompt without the search section
-    currentClaudeSystemPrompt = getSystemPrompt(profile, customPrompt, false, background);
+    currentClaudeSystemPrompt = buildClaudeSystemPrompt(getSystemPrompt(profile, customPrompt, false, background));
 
     // Initialize new conversation session only on first connect
     if (!isReconnect) {
@@ -829,17 +936,22 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     logTransportEvent('gemini.live.message', message);
 
                     // Handle input transcription (what was spoken)
+                    let transcriptFragment = '';
                     if (message.serverContent?.inputTranscription?.results) {
-                        currentTranscription += formatSpeakerResults(message.serverContent.inputTranscription.results);
+                        transcriptFragment = formatSpeakerResults(message.serverContent.inputTranscription.results);
                     } else if (message.serverContent?.inputTranscription?.text) {
                         const text = message.serverContent.inputTranscription.text;
                         if (text.trim() !== '') {
-                            currentTranscription += text;
+                            transcriptFragment = text;
                         }
                     }
 
-                    if (message.serverContent?.inputTranscription) {
-                        sendFinalTranscriptionToAnswerEngine();
+                    if (transcriptFragment) {
+                        currentTranscription += transcriptFragment;
+                        // Claude / Groq answer once the speaker pauses, not on the first fragment
+                        if (hasExternalAnswerEngine()) {
+                            queueTranscriptFragment(transcriptFragment);
+                        }
                     }
 
                     if (!hasExternalAnswerEngine() && message.serverContent?.outputTranscription?.text) {
@@ -861,8 +973,10 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     if (message.serverContent?.turnComplete) {
                         currentTranscription = '';
                         messageBuffer = '';
-                        groqRequestStartedForTurn = false;
-                        sendToRenderer('update-status', 'Listening...');
+                        // With Claude / Groq answering, their own code reports status
+                        if (!hasExternalAnswerEngine()) {
+                            sendToRenderer('update-status', 'Listening...');
+                        }
                     }
                 },
                 onerror: function (e) {
@@ -1396,8 +1510,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             console.log('Sending text message:', text);
 
             if (hasExternalAnswerEngine()) {
-                groqRequestStartedForTurn = true;
-                sendTextToAnswerEngine(text.trim());
+                sendTypedTextToAnswerEngine(text.trim());
             }
 
             await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
@@ -1438,6 +1551,8 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     ipcMain.handle('close-session', async event => {
         try {
             stopMacOSAudioCapture();
+            resetPendingUtterance();
+            resetClaudeSpeechState();
 
             if (currentProviderMode === 'cloud') {
                 closeCloud();
@@ -1519,7 +1634,8 @@ module.exports = {
     stopMacOSAudioCapture,
     sendAudioToGemini,
     sendImageToGeminiHttp,
-    sendToClaude,
+    sendSpeechToClaude,
+    sendTypedTextToClaude,
     sendImageToClaude,
     setupGeminiIpcHandlers,
     formatSpeakerResults,
